@@ -4,25 +4,20 @@ import requests
 import zipfile
 import io
 import os
-from openai import OpenAI  # ✅ NVIDIA-compatible OpenAI SDK
+from openai import OpenAI  # NVIDIA-compatible OpenAI SDK
 
 app = Flask(__name__)
-
-# -----------------------------
-# FIXED CORS
-# -----------------------------
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
 # -----------------------------
 # NVIDIA API SETUP
 # -----------------------------
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
-NVIDIA_BASE_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")  # replace with your endpoint
+NVIDIA_BASE_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
 
 if not NVIDIA_API_KEY:
     raise ValueError("Please set NVIDIA_API_KEY in environment variables.")
 
-# OpenAI-compatible NVIDIA client
 client = OpenAI(api_key=NVIDIA_API_KEY, base_url=NVIDIA_BASE_URL)
 
 # -----------------------------
@@ -53,12 +48,11 @@ def pipelines():
         res = requests.get(url, headers=headers)
         res.raise_for_status()
         return jsonify(res.json())
-
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 # -----------------------------
-# Fetch logs (ZIP from GitHub)
+# Fetch logs (single string for frontend)
 # -----------------------------
 @app.route("/logs", methods=["POST"])
 def logs():
@@ -76,52 +70,44 @@ def logs():
 
         res = requests.get(url, headers=headers)
         res.raise_for_status()
-        
         z = zipfile.ZipFile(io.BytesIO(res.content))
         all_logs = []
 
-        # Keywords to IGNORE (The "Noise")
         ignore_keywords = [
-            "downloading", "extracting", "waiting", "preparing", 
+            "downloading", "extracting", "waiting", "preparing",
             "post-job", "cleaning up", "setup", "cache"
         ]
 
         for file in z.namelist():
-            # Skip hidden files or metadata in the zip
             if file.startswith('.') or '/' in file:
                 continue
-                
             raw_content = z.read(file).decode("utf-8", errors="ignore")
             lines = raw_content.splitlines()
-            
             cleaned_lines = []
+
             for line in lines:
-                # 1. Strip the leading timestamp (usually 30 characters like '2026-04-01T...')
-                # This saves massive token space
                 if len(line) > 30 and line[10] == 'T':
                     line = line[30:]
-
-                # 2. Filter out noisy progress lines
                 if not any(key in line.lower() for key in ignore_keywords):
                     cleaned_lines.append(line.strip())
 
             if cleaned_lines:
                 all_logs.append(f"--- File: {file} ---\n" + "\n".join(cleaned_lines))
 
-        # Join everything back together
         full_text = "\n".join(all_logs)
 
-        # 3. TAIL SELECTION: Take the last 7,000 characters. 
-        # Most errors happen at the end of the log.
-        if len(full_text) > 7000:
-            full_text = "...(earlier logs omitted)...\n" + full_text[-7000:]
+        # Optional: truncate if too large for frontend
+        if len(full_text) > 2000000:
+            full_text = "...(earlier logs omitted)...\n" + full_text[-2000000:]
 
+        # Return as a single string (frontend safe)
         return jsonify({"logs": full_text})
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 # -----------------------------
-# Analyze logs using NVIDIA API 🔥
+# Analyze logs using NVIDIA API (chunked internally)
 # -----------------------------
 @app.route("/analyze", methods=["POST"])
 def analyze():
@@ -130,33 +116,37 @@ def analyze():
         if not data or "logs" not in data:
             return jsonify({"error": "Missing 'logs' in request body"}), 400
 
-        logs = data["logs"]
+        full_logs = data["logs"]
+        chunk_size = 7000
+        chunks = [full_logs[i:i + chunk_size] for i in range(0, len(full_logs), chunk_size)]
+        results = []
 
-        prompt = f"""
-You are a senior DevOps engineer. Analyze the following CI/CD log and do ALL of these:
+        for idx, chunk in enumerate(chunks):
+            prompt = f"""
+You are a senior DevOps engineer. Analyze this section of CI/CD logs:
 
-1. Identify any errors, warnings, or anomalies — even subtle ones
-2. If no explicit error exists, look for missing steps, unexpected silences, slow durations, incomplete sequences, or config issues
-3. State your confidence level (high / medium / low)
-4. If the log appears truncated or incomplete, say so explicitly
-5. Give a concrete fix for each finding
+1. Identify errors, warnings, anomalies
+2. Look for missing steps, unexpected silences, slow durations
+3. State confidence level (high/medium/low)
+4. Suggest concrete fixes
 
-If nothing is wrong, say "No issues found" and explain why the log looks healthy.
-
-LOG:
-{logs}
+LOG SECTION:
+{chunk}
 """
+            response = client.chat.completions.create(
+                model="meta/llama3-8b-instruct",
+                messages=[
+                    {"role": "system", "content": "You are a helpful DevOps assistant."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3
+            )
 
-        response = client.chat.completions.create(
-            model="meta/llama3-8b-instruct",  # ✅ Replace with your NVIDIA model
-            messages=[
-                {"role": "system", "content": "You are a helpful DevOps assistant."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.3
-        )
+            results.append(response.choices[0].message.content)
 
-        return jsonify({"analysis": response.choices[0].message.content})
+        # Join results into a single string for frontend
+        final_analysis = "\n\n--- NEXT CHUNK ---\n\n".join(results)
+        return jsonify({"analysis": final_analysis})
 
     except Exception as e:
         print("Error in analyze:", e)
